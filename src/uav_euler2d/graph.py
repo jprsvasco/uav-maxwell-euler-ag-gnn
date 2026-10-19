@@ -16,10 +16,10 @@ Changes with respect to the first version (all backward compatible):
    two face centres, its length and the signed turning angle between the two
    outward normals (the scalar and bivector parts of the geometric product of
    the normals).
-4. The contour is validated on construction: counter-clockwise orientation,
+4. The contour is checked on construction: counter-clockwise orientation,
    outward normals consistent with the contour tangent, closing gap and
-   duplicated face centres.  Hard violations raise ``ValueError``; the
-   numbers are stored in ``validation`` for inspection.
+   duplicated face centres.  The check is diagnostic by default (stored in
+   ``validation``); ``strict_validation=True`` turns issues into errors.
 5. Flow conditions and global coefficients are attached to the graph as
    separate graph-level inputs and targets.
 6. ``to_arrays`` exports node/edge features and ``edge_index`` as NumPy
@@ -167,6 +167,11 @@ class SurfaceGraph:
         """
         import numpy as np
 
+        required = ("x_over_c", "y_over_c", "s_over_c", "side")
+        missing = [k for k in required if k not in self.nodes[0].inputs] + \
+                  ([] if "Cp" in self.nodes[0].targets else ["Cp"])
+        if missing:
+            raise ValueError(f"{self.case_id}: to_arrays needs surface columns {missing}")
         position = {node.node_id: i for i, node in enumerate(self.nodes)}
         c = self.chord_ref_m
         x = np.array([[float(n.inputs["x_over_c"]), float(n.inputs["y_over_c"]),
@@ -218,7 +223,7 @@ def _make_edge(a: SurfaceNode, b: SurfaceNode, direction: str, connectivity: str
     )
 
 
-def validate_contour(nodes: tuple[SurfaceNode, ...], case_id: str) -> dict[str, Any]:
+def validate_contour(nodes: tuple[SurfaceNode, ...], case_id: str, strict: bool = False) -> dict[str, Any]:
     """Check orientation, normals and closure of an ordered closed contour.
 
     - Orientation: signed polygon area (shoelace formula) must be positive,
@@ -228,6 +233,10 @@ def validate_contour(nodes: tuple[SurfaceNode, ...], case_id: str) -> dict[str, 
       central differences of the face centres.
     - Closure: the closing edge (last -> first face) must not be much longer
       than a typical edge, otherwise the contour is open or misordered.
+
+    By default the check is diagnostic (consistent with ``geometry.py``):
+    the issues are reported in ``issues`` and ``passed``.  With
+    ``strict=True`` the first issue raises ``ValueError``.
     """
     n = len(nodes)
     xs = [node.x_m for node in nodes]
@@ -257,22 +266,33 @@ def validate_contour(nodes: tuple[SurfaceNode, ...], case_id: str) -> dict[str, 
         "min_normal_tangent_alignment": min_align, "misaligned_normals": misaligned,
         "duplicate_centres": duplicates,
     }
+    issues = []
     if area <= 0:
-        raise ValueError(f"{case_id}: contour is clockwise (signed area {area:.3e} m2); expected ccw")
+        issues.append(f"{case_id}: contour is not counter-clockwise (signed area {area:.3e} m2)")
     if misaligned > 0:
-        raise ValueError(f"{case_id}: {misaligned} normals inconsistent with the contour tangent")
+        issues.append(f"{case_id}: {misaligned} normals inconsistent with the contour tangent")
     if report["closing_gap_ratio"] > _MAX_CLOSING_GAP_RATIO:
-        raise ValueError(f"{case_id}: closing gap is {report['closing_gap_ratio']:.2f} x the median edge")
+        issues.append(f"{case_id}: closing gap is {report['closing_gap_ratio']:.2f} x the median edge")
     if duplicates:
-        raise ValueError(f"{case_id}: {duplicates} duplicated consecutive face centres")
+        issues.append(f"{case_id}: {duplicates} duplicated consecutive face centres")
+    report["issues"] = issues
+    report["passed"] = not issues
+    if strict and issues:
+        raise ValueError("; ".join(issues))
     return report
 
 
 # ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
-def build_surface_graph(dataset: Euler2DDataset, case_id: str) -> SurfaceGraph:
-    """Build only the contour graph explicitly supported by the source data."""
+def build_surface_graph(dataset: Euler2DDataset, case_id: str,
+                        strict_validation: bool = False) -> SurfaceGraph:
+    """Build only the contour graph explicitly supported by the source data.
+
+    The contour check is stored in ``SurfaceGraph.validation``; it raises only
+    when ``strict_validation`` is True.  Input columns absent from the source
+    are simply omitted from ``inputs``; ``to_arrays`` requires them.
+    """
     case = dataset.case(case_id)
     if case["status"] == "failed":
         raise ValueError(f"cannot build a surface graph for failed case {case_id}")
@@ -282,9 +302,6 @@ def build_surface_graph(dataset: Euler2DDataset, case_id: str) -> SurfaceGraph:
     indices = [int(row["contour_index"]) for row in rows]
     if indices != list(range(len(rows))):
         raise ValueError(f"{case_id}: contour_index must be contiguous and ordered")
-    missing = [c for c in INPUT_COLUMNS + ("Cp",) if c not in rows[0]]
-    if missing:
-        raise ValueError(f"{case_id}: missing surface columns {missing}")
 
     nodes: list[SurfaceNode] = []
     for row in rows:
@@ -308,7 +325,7 @@ def build_surface_graph(dataset: Euler2DDataset, case_id: str) -> SurfaceGraph:
             )
         )
     node_tuple = tuple(nodes)
-    validation = validate_contour(node_tuple, case_id)
+    validation = validate_contour(node_tuple, case_id, strict=strict_validation)
 
     count = len(node_tuple)
     forward = tuple(_make_edge(node_tuple[i], node_tuple[(i + 1) % count], "forward", "boundary_contour")
